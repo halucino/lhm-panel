@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 运行时数据（配置与日志），不进仓库
+/data/
+*.log
+*.bak
+
+# 编辑器
+.vscode/
+.idea/
+*.user
+*.suo
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
