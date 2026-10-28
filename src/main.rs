@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod tray;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -314,11 +316,15 @@ fn is_default_enabled(s: &Sensor) -> bool {
 struct Config {
     width: f32,
     height: f32,
-    /// 窗口左上角的屏幕坐标（物理像素）。None 表示首次运行，交给系统决定位置。
+    /// 窗口左上角的屏幕坐标（**逻辑像素**）。None 表示首次运行，交给系统决定位置。
+    /// 早期版本误存为物理像素，见 `pos_migrated`。
     #[serde(default)]
     pos_x: Option<i32>,
     #[serde(default)]
     pos_y: Option<i32>,
+    /// 坐标单位迁移标记：false 表示还是旧版物理像素值，需要丢弃一次。
+    #[serde(default)]
+    pos_migrated: bool,
     opacity: f32,
     font_scale: f32,
     show_bars: bool,
@@ -340,6 +346,7 @@ impl Default for Config {
             height: 440.0,
             pos_x: None,
             pos_y: None,
+            pos_migrated: true,
             opacity: 0.92,
             font_scale: 1.0,
             show_bars: false,
@@ -369,6 +376,15 @@ fn load_config() -> Config {
     if !cfg.bars_migrated {
         cfg.show_bars = false;
         cfg.bars_migrated = true;
+    }
+    // 坐标单位迁移：旧版把物理像素直接存进 pos_x/pos_y，
+    // 现在统一按逻辑像素处理，旧值若继续用会再漂一次（DPI≠100% 时）。
+    // 直接丢弃旧坐标，让系统重新居中放置一次，之后按新单位记录。
+    if !cfg.pos_migrated {
+        cfg.pos_x = None;
+        cfg.pos_y = None;
+        cfg.pos_migrated = true;
+        log_line("坐标单位迁移：已丢弃旧版物理像素坐标");
     }
     cfg
 }
@@ -629,6 +645,12 @@ struct PanelApp {
     launch_tried: bool,
     launch_note: String,
     saved_once: bool,
+    /// 系统托盘。创建失败时为 None，不影响主功能。
+    tray: Option<crate::tray::Tray>,
+    /// 是否已用 Win32 API 恢复过窗口位置（只做一次）
+    pos_restored: bool,
+    /// 在此时间点之前不记录窗口坐标，避免把恢复过程中的中间态写回配置
+    skip_pos_record_until: Instant,
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -669,6 +691,17 @@ impl PanelApp {
         let interval = Arc::new(AtomicU64::new(700));
         let (tx, rx) = channel();
         spawn_collector(interval.clone(), tx);
+
+        // 托盘图标：用 32×32 的小图。
+        // Windows 托盘期望 16/32/48 尺寸，1024×1024 的原图会被 Shell 拒绝，
+        // 表现为「注册成功但看不到图标」。
+        const TRAY_PNG: &[u8] = include_bytes!("../assets/tray32.png");
+        let tray = crate::tray::Tray::new(TRAY_PNG, cfg.autostart);
+        match &tray {
+            Some(_) => log_line("托盘图标已创建"),
+            None => log_line("托盘创建失败，仅使用主窗口"),
+        }
+
         Self {
             rx,
             sensors: Vec::new(),
@@ -681,6 +714,9 @@ impl PanelApp {
             launch_tried: false,
             launch_note: String::new(),
             saved_once: false,
+            tray,
+            pos_restored: false,
+            skip_pos_record_until: Instant::now(),
         }
     }
 
@@ -1067,7 +1103,8 @@ impl PanelApp {
             .on_hover_text(tip)
             .clicked()
         };
-        if hit(&mut child, "✕", "退出") {
+        // 退出按钮用 ❎ 更醒目，与 ⚙ 形成对比
+        if hit(&mut child, "❎", "退出") {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if hit(&mut child, "⚙", "设置") {
@@ -1125,6 +1162,34 @@ impl eframe::App for PanelApp {
             self.dirty = true;
         }
 
+        // ---- 托盘动作 ----
+        // tray-icon 的事件通过全局 handler 投递到 channel，这里每帧取一次
+        if let Some(tray) = &self.tray {
+            while let Some(action) = tray.poll() {
+                match action {
+                    tray::TrayAction::Show => {
+                        // 把窗口拉回前台；若已最小化则还原
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    tray::TrayAction::ToggleAutostart => {
+                        let next = !self.cfg.autostart;
+                        if set_autostart(next) {
+                            self.cfg.autostart = next;
+                            self.dirty = true;
+                            tray.set_autostart_enabled(next);
+                            log_line(&format!("托盘切换开机自启: {next}"));
+                        } else {
+                            log_line("托盘切换开机自启失败");
+                        }
+                    }
+                    tray::TrayAction::Exit => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
         // 没有数据且已等待 6 秒 → 自动提权拉起 LHM（只试一次）
         if self.sensors.is_empty()
             && self.cfg.auto_launch
@@ -1141,17 +1206,41 @@ impl eframe::App for PanelApp {
             };
         }
 
-        let rect = ctx.screen_rect();
-        self.cfg.width = rect.width();
-        self.cfg.height = rect.height();
-
-        // 记录窗口左上角坐标：位置变化时标脏，交由下面的节流逻辑落盘
+        // 记录窗口位置与尺寸。
+        //
+        // 单位说明（实测 200% 缩放验证）：
+        //   - `outer_rect` 返回**物理像素**
+        //   - eframe 0.29 的 `with_position` / `with_inner_size` 在 Windows 上
+        //     同样按**物理像素**处理（不会乘 DPI）
+        // 所以两端单位一致，直接用 `outer_rect` 的原值存盘即可，无需换算。
+        // 早前误按逻辑像素处理，导致恢复后窗口大小和位置都缩半。
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
             let x = outer.min.x.round() as i32;
             let y = outer.min.y.round() as i32;
-            if self.cfg.pos_x != Some(x) || self.cfg.pos_y != Some(y) {
+            let w = outer.width().round();
+            let h = outer.height().round();
+
+            // 位置恢复完成前，绝不记录坐标。
+            //
+            // 否则会踩到经典的「先写后读」：首帧记录逻辑把默认位置（如 123,123）
+            // 写进 self.cfg，随后 restore_window_position 读到的就是被污染的值。
+            // 注意这里只跳过「坐标」，不能让整个 update 提前返回，
+            // 否则后面 saved_once 的首次落盘会被跳过，配置文件永远不生成。
+            let can_record_pos = self.pos_restored
+                && Instant::now() >= self.skip_pos_record_until;
+
+            if can_record_pos
+                && (self.cfg.pos_x != Some(x) || self.cfg.pos_y != Some(y))
+            {
                 self.cfg.pos_x = Some(x);
                 self.cfg.pos_y = Some(y);
+                self.dirty = true;
+            }
+            // 尺寸不受恢复流程影响，任何时候都可以记录；
+            // 排除异常值，避免窗口最小化时把配置写坏
+            if w >= 160.0 && h >= 120.0 && (self.cfg.width != w || self.cfg.height != h) {
+                self.cfg.width = w;
+                self.cfg.height = h;
                 self.dirty = true;
             }
         }
@@ -1162,9 +1251,20 @@ impl eframe::App for PanelApp {
             save_config(&self.cfg);
             log_line("首次写入配置");
 
-            // 窗口此时已创建完毕，修补扩展样式：任务栏有图标、Alt+Tab 不出现
+            // 修补扩展样式：任务栏有图标、Alt+Tab 不出现
             #[cfg(windows)]
             apply_taskbar_only_style();
+        }
+
+        // 位置恢复必须等窗口稳定后再做。
+        // 首帧调 SetWindowPos 会被 winit 的后续初始化覆盖（实测设 (600,350) 后跑到 (62,62)），
+        // 这里等到启动满 300ms 再执行一次，之后不再干预。
+        #[cfg(windows)]
+        if !self.pos_restored && self.started.elapsed() > Duration::from_millis(300) {
+            self.pos_restored = true;
+            restore_window_position(&self.cfg);
+            // 刚恢复完，别让下面的记录逻辑把中间态写回配置
+            self.skip_pos_record_until = Instant::now() + Duration::from_millis(500);
         }
 
         if self.dirty && self.last_save.elapsed() > Duration::from_millis(500) {
@@ -1224,10 +1324,9 @@ fn run() -> eframe::Result<()> {
             .with_taskbar(true)
             .with_title("LHM Panel");
 
-        // 恢复上次退出时的窗口位置；首次运行则交给系统放置
-        if let (Some(x), Some(y)) = (cfg.pos_x, cfg.pos_y) {
-            vb = vb.with_position([x as f32, y as f32]);
-        }
+        // 位置不在这里设：eframe 的 with_position 在双屏 + DPI 缩放场景下会算错，
+        // 改由首帧的 restore_window_position() 用 SetWindowPos 精确恢复。
+        let _ = (cfg.pos_x, cfg.pos_y);
 
         eframe::NativeOptions {
             viewport: vb,
@@ -1255,6 +1354,63 @@ fn run() -> eframe::Result<()> {
         return r2;
     }
     r
+}
+
+/// 用 Win32 `SetWindowPos` 把窗口放到配置里记录的坐标。
+///
+/// 为什么不用 eframe 的 `with_position`：在「双屏 + 200% 缩放」环境下实测，
+/// 存 (600,350) 恢复后变成 (-60,364)，X 轴偏移一个屏幕宽度。
+/// 直接调系统 API 可以完全控制，且与 `outer_rect` 的物理像素坐标一致。
+#[cfg(windows)]
+fn restore_window_position(cfg: &Config) {
+    let (Some(x), Some(y)) = (cfg.pos_x, cfg.pos_y) else {
+        return;
+    };
+
+    use windows::core::HSTRING;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    unsafe {
+        let title = HSTRING::from("LHM Panel");
+        let Ok(hwnd) = FindWindowW(None, &title) else {
+            log_line("恢复位置：找不到窗口句柄");
+            return;
+        };
+        if hwnd.is_invalid() {
+            log_line("恢复位置：句柄无效");
+            return;
+        }
+
+        // 坐标补偿：乘以 DPI 缩放比。
+        //
+        // 实测（200% 缩放）两端单位不一致：
+        //   - `outer_rect` / `GetWindowRect` 返回**物理像素**
+        //   - `SetWindowPos` 在本进程里按**逻辑像素**解释传入值
+        // 直接传 600 会落在物理 300；乘 2 后传 1200 才落在物理 600。
+        let dpi = GetDpiForWindow(hwnd);
+        let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+        let px = (x as f32 * scale).round() as i32;
+        let py = (y as f32 * scale).round() as i32;
+
+        let r = SetWindowPos(
+            hwnd,
+            None,
+            px,
+            py,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        match r {
+            Ok(()) => log_line(&format!(
+                "恢复位置: 目标({x},{y}) dpi={dpi} scale={scale} 传入({px},{py})"
+            )),
+            Err(e) => log_line(&format!("恢复位置失败: {e:?}")),
+        }
+    }
 }
 
 /// 让窗口留在任务栏（有图标、可点击还原），但不出现在 Alt+Tab 列表里。
