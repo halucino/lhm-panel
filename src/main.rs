@@ -1208,17 +1208,21 @@ impl eframe::App for PanelApp {
 
         // 记录窗口位置与尺寸。
         //
-        // 单位说明（实测 200% 缩放验证）：
-        //   - `outer_rect` 返回**物理像素**
-        //   - eframe 0.29 的 `with_position` / `with_inner_size` 在 Windows 上
-        //     同样按**物理像素**处理（不会乘 DPI）
-        // 所以两端单位一致，直接用 `outer_rect` 的原值存盘即可，无需换算。
-        // 早前误按逻辑像素处理，导致恢复后窗口大小和位置都缩半。
-        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-            let x = outer.min.x.round() as i32;
-            let y = outer.min.y.round() as i32;
-            let w = outer.width().round();
-            let h = outer.height().round();
+        // 用 Win32 `GetWindowRect` 而不是 eframe 的 `outer_rect`：
+        // 恢复用的是 `SetWindowPos`，只有 `GetWindowRect` 与它单位严格一致。
+        // `outer_rect` 在跨屏 / DPI 混合下会被 eframe 额外换算，实测把用户拖出的
+        // 380×440 记成 570×660（1.5 倍），重启后窗口就变大。
+        if let Some((px, py, pw, ph)) = window_rect() {
+            // `window_rect()` 给的是**物理像素**，而配置文件统一存**逻辑像素**：
+            //   - 记录时除以缩放比
+            //   - 恢复时 `SetWindowPos` 接收逻辑值，系统自己换算回物理像素
+            // 这样才能做到「用户拖 380，存的也是 380，重启还是 380」。
+            // 若直接存物理像素（200% 屏下是 760），重启后窗口就会翻倍。
+            let s = system_dpi_scale().max(0.5);
+            let x = (px as f32 / s).round() as i32;
+            let y = (py as f32 / s).round() as i32;
+            let w = (pw / s).round();
+            let h = (ph / s).round();
 
             // 位置恢复完成前，绝不记录坐标。
             //
@@ -1309,12 +1313,39 @@ impl eframe::App for PanelApp {
     }
 }
 
+/// 取主屏的 DPI 缩放比（1.0 / 1.25 / 1.5 / 2.0 …）。
+/// 只在窗口创建前用于估算初始尺寸，不参与精确定位。
+#[cfg(windows)]
+fn system_dpi_scale() -> f32 {
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+    unsafe {
+        let dpi = GetDpiForSystem();
+        if dpi > 0 {
+            dpi as f32 / 96.0
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn system_dpi_scale() -> f32 {
+    1.0
+}
+
 fn run() -> eframe::Result<()> {
     let cfg = load_config();
 
     let make = |transparent: bool, decorated: bool| {
+        // 初始尺寸按逻辑像素给（with_inner_size 的语义），
+        // 但配置里存的是物理像素，所以除以系统缩放。
+        // 真正的精确尺寸由 restore_window_position() 用 SetWindowPos 设置。
+        let scale = system_dpi_scale();
+        let init_w = (cfg.width / scale).max(160.0);
+        let init_h = (cfg.height / scale).max(120.0);
+
         let mut vb = egui::ViewportBuilder::default()
-            .with_inner_size([cfg.width, cfg.height])
+            .with_inner_size([init_w, init_h])
             .with_min_inner_size([160.0, 120.0])
             .with_decorations(decorated)
             .with_transparent(transparent)
@@ -1362,6 +1393,28 @@ fn run() -> eframe::Result<()> {
 /// 存 (600,350) 恢复后变成 (-60,364)，X 轴偏移一个屏幕宽度。
 /// 直接调系统 API 可以完全控制，且与 `outer_rect` 的物理像素坐标一致。
 #[cfg(windows)]
+fn window_rect() -> Option<(i32, i32, f32, f32)> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
+
+    unsafe {
+        let title = HSTRING::from("LHM Panel");
+        let hwnd = FindWindowW(None, &title).ok()?;
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).ok()?;
+        Some((
+            r.left,
+            r.top,
+            (r.right - r.left) as f32,
+            (r.bottom - r.top) as f32,
+        ))
+    }
+}
+
 fn restore_window_position(cfg: &Config) {
     let (Some(x), Some(y)) = (cfg.pos_x, cfg.pos_y) else {
         return;
@@ -1370,7 +1423,7 @@ fn restore_window_position(cfg: &Config) {
     use windows::core::HSTRING;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        FindWindowW, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
     };
 
     unsafe {
@@ -1384,14 +1437,19 @@ fn restore_window_position(cfg: &Config) {
             return;
         }
 
-        // 坐标补偿：乘以 DPI 缩放比。
+        // 配置里存的是**逻辑像素**，`SetWindowPos` 要的是**物理像素**，所以乘以缩放比。
         //
-        // 实测（200% 缩放）两端单位不一致：
-        //   - `outer_rect` / `GetWindowRect` 返回**物理像素**
-        //   - `SetWindowPos` 在本进程里按**逻辑像素**解释传入值
-        // 直接传 600 会落在物理 300；乘 2 后传 1200 才落在物理 600。
+        // 这是实测出来的配对关系：
+        //   记录端  window_rect() 物理像素 ÷ scale  →  配置里的逻辑像素
+        //   恢复端  配置里的逻辑像素 × scale        →  SetWindowPos 的物理像素
+        // 少任何一边都会让窗口整体缩放一倍（实测传 380 变成 190）。
         let dpi = GetDpiForWindow(hwnd);
         let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+
+        let lw = if cfg.width >= 160.0 { cfg.width } else { 380.0 };
+        let lh = if cfg.height >= 120.0 { cfg.height } else { 440.0 };
+        let pw = (lw * scale).round() as i32;
+        let ph = (lh * scale).round() as i32;
         let px = (x as f32 * scale).round() as i32;
         let py = (y as f32 * scale).round() as i32;
 
@@ -1400,13 +1458,13 @@ fn restore_window_position(cfg: &Config) {
             None,
             px,
             py,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            pw,
+            ph,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
         match r {
             Ok(()) => log_line(&format!(
-                "恢复位置: 目标({x},{y}) dpi={dpi} scale={scale} 传入({px},{py})"
+                "恢复: 逻辑({x},{y}) {lw}x{lh} × {scale} → 物理({px},{py}) {pw}x{ph} dpi={dpi}"
             )),
             Err(e) => log_line(&format!("恢复位置失败: {e:?}")),
         }
@@ -1490,7 +1548,32 @@ fn apply_taskbar_only_style() {
     });
 }
 
+/// 声明进程为 Per-Monitor V2 DPI 感知。
+///
+/// 不声明时，Windows 会对进程做位图拉伸虚拟化：
+///   - `GetDpiForWindow` 返回主屏 DPI，即使窗口在另一块屏上
+///   - `GetWindowRect` 与 `SetWindowPos` 的坐标含义随上下文漂移
+/// 实测在「主屏 1x + 副屏 1x 但被虚拟化」的组合下，配置会存成 229×326，
+/// 而用户实际拖出的是 380×440。声明之后坐标就是物理像素，不再被换算。
+#[cfg(windows)]
+fn enable_per_monitor_dpi() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            Ok(()) => {}
+            Err(_) => {
+                // 已经由 manifest 或系统设过，忽略
+            }
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    enable_per_monitor_dpi();
+
     std::panic::set_hook(Box::new(|info| {
         log_line(&format!("PANIC: {info}"));
     }));
