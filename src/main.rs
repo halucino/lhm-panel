@@ -1240,9 +1240,16 @@ impl eframe::App for PanelApp {
                 self.cfg.pos_y = Some(y);
                 self.dirty = true;
             }
-            // 尺寸不受恢复流程影响，任何时候都可以记录；
-            // 排除异常值，避免窗口最小化时把配置写坏
-            if w >= 160.0 && h >= 120.0 && (self.cfg.width != w || self.cfg.height != h) {
+            // 尺寸也必须等恢复完成后再记录。
+            //
+            // 否则会覆盖用户上次拖出的真实尺寸：启动后的前 300ms 窗口还是
+            // eframe 用 `with_inner_size` 创建的初始尺寸，此时记录会把配置里
+            // 正确的 315×479 覆盖成临时的 341×486，随后 restore 读到的就是错值。
+            if can_record_pos
+                && w >= 160.0
+                && h >= 120.0
+                && (self.cfg.width != w || self.cfg.height != h)
+            {
                 self.cfg.width = w;
                 self.cfg.height = h;
                 self.dirty = true;
