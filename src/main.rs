@@ -88,14 +88,22 @@ struct Sensor {
     device: String,
 }
 
+/// 从 LHM 的 SensorId 里取设备前缀（前两段），例如
+/// `/amdcpu/0/temperature/2` → `amdcpu/0`。
+///
+/// 空串或全斜杠必须回退到 `"device"`：
+/// `str::split` 对空输入也会产出一个空元素，所以直接 `parts.next().unwrap_or("device")`
+/// 的兜底永远不触发，会返回空字符串。这里先过滤空段，再用 match 兜底。
 fn device_from_identifier(id: &str) -> String {
-    let mut parts = id.trim_start_matches('/').split('/');
-    let a = parts.next().unwrap_or("device");
-    let b = parts.next().unwrap_or("");
-    if b.is_empty() {
-        a.to_string()
-    } else {
-        format!("{a}/{b}")
+    let mut parts = id
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
+
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}/{b}"),
+        (Some(a), None) => a.to_string(),
+        _ => "device".to_string(),
     }
 }
 
@@ -182,8 +190,15 @@ fn is_disk_device(device: &str) -> bool {
         || d.contains("aigo")
 }
 
-/// 阈值/告警类传感器：显示的是盘的报警点（如 Warning 119°C），不是实测温度，
-/// 混进面板会被误读成过热，默认不勾选、也不提供勾选。
+/// 阈值/告警类传感器：显示的是门限值而非实测温度，默认不勾选。
+///
+/// 覆盖两类来源：
+///   1. NVMe 盘：`Warning Temperature` / `Critical Temperature`
+///   2. 内存条 SPD：`Thermal Sensor Low/High Limit`、
+///      `Thermal Sensor Critical Low/High Limit`、`Temperature Sensor Resolution`
+///
+/// 第 2 类早期漏判过——它们既不含 `threshold` 也不含 `warning temperature`，
+/// 结果默认勾选时混进一堆恒定的假温度（实测一次冒出 37 项，其中大半是内存门限）。
 fn is_threshold_sensor(s: &Sensor) -> bool {
     let n = s.name.to_ascii_lowercase();
     n.contains("warning temperature")
@@ -192,6 +207,10 @@ fn is_threshold_sensor(s: &Sensor) -> bool {
         || n.contains("critical temp")
         || n.contains("threshold")
         || n.contains("alarm")
+        // 内存条 SPD 的规格门限
+        || n.contains("limit")
+        || n.contains("resolution")
+        || n.contains("thermal sensor")
 }
 
 /// 面板/设置页里显示的名字：硬盘类带上设备前缀，其他保持原名。
@@ -1218,7 +1237,13 @@ impl eframe::App for PanelApp {
             //   - 恢复时 `SetWindowPos` 接收逻辑值，系统自己换算回物理像素
             // 这样才能做到「用户拖 380，存的也是 380，重启还是 380」。
             // 若直接存物理像素（200% 屏下是 760），重启后窗口就会翻倍。
-            let s = system_dpi_scale().max(0.5);
+            // 缩放比必须用**窗口所在屏**的 DPI，不能用主屏的。
+            //
+            // `system_dpi_scale()` 走 `GetDpiForSystem()`，返回的是进程启动时主屏的 DPI，
+            // 窗口移到缩放不同的副屏后这个值不会更新。而恢复端用的是
+            // `GetDpiForWindow()`（窗口实际所在屏），两端不一致就会存错尺寸——
+            // 实测把窗口拖到 300% 缩放的屏后，配置被记成 307×476，而实际是 204×317。
+            let s = window_dpi_scale().max(0.5);
             let x = (px as f32 / s).round() as i32;
             let y = (py as f32 / s).round() as i32;
             let w = (pw / s).round();
@@ -1399,6 +1424,34 @@ fn run() -> eframe::Result<()> {
 /// 为什么不用 eframe 的 `with_position`：在「双屏 + 200% 缩放」环境下实测，
 /// 存 (600,350) 恢复后变成 (-60,364)，X 轴偏移一个屏幕宽度。
 /// 直接调系统 API 可以完全控制，且与 `outer_rect` 的物理像素坐标一致。
+#[cfg(windows)]
+fn window_dpi_scale() -> f32 {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    unsafe {
+        let title = HSTRING::from("LHM Panel");
+        let Ok(hwnd) = FindWindowW(None, &title) else {
+            return 1.0;
+        };
+        if hwnd.is_invalid() {
+            return 1.0;
+        }
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi > 0 {
+            dpi as f32 / 96.0
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn window_dpi_scale() -> f32 {
+    1.0
+}
+
 #[cfg(windows)]
 fn window_rect() -> Option<(i32, i32, f32, f32)> {
     use windows::core::HSTRING;
