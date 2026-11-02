@@ -20,6 +20,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconEvent};
 /// 托盘产生的动作，交给 UI 线程处理。
 pub enum TrayAction {
     Show,
+    /// 只重置窗口大小与位置，保留传感器选择
+    ResetGeometry,
     ToggleAutostart,
     Exit,
 }
@@ -117,9 +119,12 @@ fn build_tray(
 
     let menu = tray_icon::menu::Menu::new();
     let show_item = MenuItem::new("显示面板", true, None);
+    let reset_geo_item = MenuItem::new("重置窗口位置", true, None);
     let autostart_item = MenuItem::new(autostart_label(autostart_enabled), true, None);
     let exit_item = MenuItem::new("退出", true, None);
     let _ = menu.append(&show_item);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&reset_geo_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&autostart_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -143,12 +148,15 @@ fn build_tray(
 
     // 菜单事件：把菜单项 id 映射成动作
     let show_id = show_item.id().clone();
+    let geo_id = reset_geo_item.id().clone();
     let auto_id = autostart_item.id().clone();
     let exit_id = exit_item.id().clone();
     let tx_menu = action_tx.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == show_id {
             let _ = tx_menu.send(TrayAction::Show);
+        } else if e.id == geo_id {
+            let _ = tx_menu.send(TrayAction::ResetGeometry);
         } else if e.id == auto_id {
             let _ = tx_menu.send(TrayAction::ToggleAutostart);
         } else if e.id == exit_id {

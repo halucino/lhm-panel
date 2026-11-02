@@ -384,10 +384,27 @@ fn config_path() -> PathBuf {
 }
 
 fn load_config() -> Config {
-    let mut cfg = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .unwrap_or_default();
+    let path = config_path();
+    let mut cfg = match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<Config>(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                log_line(&format!(
+                    "配置解析失败（用默认值）: {e}  路径={}  长度={}",
+                    path.display(),
+                    s.len()
+                ));
+                Config::default()
+            }
+        },
+        Err(e) => {
+            log_line(&format!(
+                "配置读取失败（用默认值）: {e}  路径={}",
+                path.display()
+            ));
+            Config::default()
+        }
+    };
     // 以注册表实际状态为准，避免配置与系统不一致
     cfg.autostart = autostart_enabled();
     // 一次性迁移：旧配置里柱状图是开着的，按要求统一关掉。
@@ -1191,6 +1208,20 @@ impl eframe::App for PanelApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
+                    tray::TrayAction::ResetGeometry => {
+                        // 只重置窗口几何，不动 enabled / initialized，
+                        // 否则程序会以为配置是全新的，重新套用默认传感器集合。
+                        self.cfg.width = 380.0;
+                        self.cfg.height = 440.0;
+                        self.cfg.pos_x = None;
+                        self.cfg.pos_y = None;
+                        self.dirty = true;
+                        #[cfg(windows)]
+                        center_on_primary();
+                        // 居中后的位置允许被记录（下一次启动就按新坐标走）
+                        self.skip_pos_record_until = Instant::now();
+                        log_line("托盘：已重置窗口位置与尺寸（传感器选择保留）");
+                    }
                     tray::TrayAction::ToggleAutostart => {
                         let next = !self.cfg.autostart;
                         if set_autostart(next) {
@@ -1450,6 +1481,47 @@ fn window_dpi_scale() -> f32 {
 #[cfg(not(windows))]
 fn window_dpi_scale() -> f32 {
     1.0
+}
+
+#[cfg(windows)]
+/// 把窗口移到主屏中央，尺寸设成默认的 380×440（逻辑像素）。
+///
+/// 尺寸与坐标都要按窗口所在屏的 DPI 换算成物理像素再交给 `SetWindowPos`，
+/// 与 `restore_window_position` 保持同一套单位约定。
+#[cfg(windows)]
+fn center_on_primary() {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetSystemMetrics, SetWindowPos, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+        SWP_NOZORDER,
+    };
+
+    unsafe {
+        let Ok(hwnd) = FindWindowW(None, &HSTRING::from("LHM Panel")) else {
+            log_line("居中：找不到窗口句柄");
+            return;
+        };
+        if hwnd.is_invalid() {
+            log_line("居中：句柄无效");
+            return;
+        }
+
+        let dpi = GetDpiForWindow(hwnd);
+        let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+
+        let w = (380.0 * scale).round() as i32;
+        let h = (440.0 * scale).round() as i32;
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let x = ((sw - w) / 2).max(0);
+        let y = ((sh - h) / 2).max(0);
+
+        match SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) {
+            Ok(()) => log_line(&format!("居中到主屏: ({x},{y}) {w}x{h} dpi={dpi}")),
+            Err(e) => log_line(&format!("居中失败: {e:?}")),
+        }
+    }
 }
 
 #[cfg(windows)]
