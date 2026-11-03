@@ -335,15 +335,19 @@ fn is_default_enabled(s: &Sensor) -> bool {
 struct Config {
     width: f32,
     height: f32,
-    /// 窗口左上角的屏幕坐标（**逻辑像素**）。None 表示首次运行，交给系统决定位置。
-    /// 早期版本误存为物理像素，见 `pos_migrated`。
+    /// 窗口左上角的屏幕坐标（**物理像素**，与 `GetWindowRect` 同源）。
+    /// None 表示首次运行，交给系统决定位置。
     #[serde(default)]
     pos_x: Option<i32>,
     #[serde(default)]
     pos_y: Option<i32>,
-    /// 坐标单位迁移标记：false 表示还是旧版物理像素值，需要丢弃一次。
+    /// 历史迁移标记（保留字段，仅用于兼容旧配置）。
     #[serde(default)]
     pos_migrated: bool,
+    /// 几何单位迁移标记：false 表示 width/height/pos_x/pos_y 还是旧版「逻辑像素」，
+    /// 需要丢弃一次并重新记录为物理像素。
+    #[serde(default)]
+    geom_physical: bool,
     opacity: f32,
     font_scale: f32,
     show_bars: bool,
@@ -366,6 +370,7 @@ impl Default for Config {
             pos_x: None,
             pos_y: None,
             pos_migrated: true,
+            geom_physical: true,
             opacity: 0.92,
             font_scale: 1.0,
             show_bars: false,
@@ -413,14 +418,22 @@ fn load_config() -> Config {
         cfg.show_bars = false;
         cfg.bars_migrated = true;
     }
-    // 坐标单位迁移：旧版把物理像素直接存进 pos_x/pos_y，
-    // 现在统一按逻辑像素处理，旧值若继续用会再漂一次（DPI≠100% 时）。
-    // 直接丢弃旧坐标，让系统重新居中放置一次，之后按新单位记录。
-    if !cfg.pos_migrated {
+    // 几何单位迁移（第二次）：
+    //
+    // 早期版本把物理像素 ÷ DPI 存成「逻辑像素」，恢复时再 × DPI。
+    // 但记录与恢复时窗口可能位于不同显示器，`GetDpiForWindow` 返回不同的 scale，
+    // 导致坐标被算到两块屏之间的夹缝里。
+    //
+    // 现在改为全程物理像素（`GetWindowRect` 与 `SetWindowPos` 同源，零换算）。
+    // 旧配置里的值语义已变，必须丢弃一次，让系统重新居中放置。
+    // 尺寸同时回到默认值——旧尺寸也是逻辑像素，按物理值用会变成一半大小。
+    if !cfg.geom_physical {
+        cfg.width = 380.0;
+        cfg.height = 440.0;
         cfg.pos_x = None;
         cfg.pos_y = None;
-        cfg.pos_migrated = true;
-        log_line("坐标单位迁移：已丢弃旧版物理像素坐标");
+        cfg.geom_physical = true;
+        log_line("几何单位迁移：已丢弃旧版逻辑像素几何，恢复默认尺寸");
     }
     cfg
 }
@@ -1263,22 +1276,20 @@ impl eframe::App for PanelApp {
         // `outer_rect` 在跨屏 / DPI 混合下会被 eframe 额外换算，实测把用户拖出的
         // 380×440 记成 570×660（1.5 倍），重启后窗口就变大。
         if let Some((px, py, pw, ph)) = window_rect() {
-            // `window_rect()` 给的是**物理像素**，而配置文件统一存**逻辑像素**：
-            //   - 记录时除以缩放比
-            //   - 恢复时 `SetWindowPos` 接收逻辑值，系统自己换算回物理像素
-            // 这样才能做到「用户拖 380，存的也是 380，重启还是 380」。
-            // 若直接存物理像素（200% 屏下是 760），重启后窗口就会翻倍。
-            // 缩放比必须用**窗口所在屏**的 DPI，不能用主屏的。
+            // 直接存 `GetWindowRect` 的物理像素，不做任何 DPI 换算。
             //
-            // `system_dpi_scale()` 走 `GetDpiForSystem()`，返回的是进程启动时主屏的 DPI，
-            // 窗口移到缩放不同的副屏后这个值不会更新。而恢复端用的是
-            // `GetDpiForWindow()`（窗口实际所在屏），两端不一致就会存错尺寸——
-            // 实测把窗口拖到 300% 缩放的屏后，配置被记成 307×476，而实际是 204×317。
-            let s = window_dpi_scale().max(0.5);
-            let x = (px as f32 / s).round() as i32;
-            let y = (py as f32 / s).round() as i32;
-            let w = (pw / s).round();
-            let h = (ph / s).round();
+            // 进程已在 main() 开头声明 Per-Monitor V2 DPI 感知，
+            // `GetWindowRect` 与 `SetWindowPos` 使用同一套物理像素坐标，
+            // 两端严格对称。
+            //
+            // 曾经在这里按「物理 ÷ scale」存逻辑像素、恢复时再「× scale」，
+            // 但两次调用 `GetDpiForWindow` 时窗口可能位于不同显示器（记录时在副屏
+            // 得到 scale=3，恢复时窗口还在主屏得到 scale=2），乘数不一致，
+            // 坐标就被算到屏幕夹缝里。去掉换算后两端同源，不会出现这种漂移。
+            let x = px;
+            let y = py;
+            let w = pw;
+            let h = ph;
 
             // 位置恢复完成前，绝不记录坐标。
             //
@@ -1569,21 +1580,20 @@ fn restore_window_position(cfg: &Config) {
             return;
         }
 
-        // 配置里存的是**逻辑像素**，`SetWindowPos` 要的是**物理像素**，所以乘以缩放比。
+        // 配置里存的就是 `GetWindowRect` 的物理像素，这里原样交给 `SetWindowPos`。
         //
-        // 这是实测出来的配对关系：
-        //   记录端  window_rect() 物理像素 ÷ scale  →  配置里的逻辑像素
-        //   恢复端  配置里的逻辑像素 × scale        →  SetWindowPos 的物理像素
-        // 少任何一边都会让窗口整体缩放一倍（实测传 380 变成 190）。
+        // 进程已声明 Per-Monitor V2 DPI 感知，两个 API 使用同一套物理像素坐标，
+        // 不做任何 DPI 换算才是对的。
+        //
+        // 之前按「逻辑 × scale」换算过，但记录时窗口在副屏、恢复时窗口还在主屏，
+        // `GetDpiForWindow` 两次返回不同的 scale（实测 3 与 2），乘数不一致，
+        // 坐标就被算到两块屏之间的夹缝里。去掉换算后两端同源。
         let dpi = GetDpiForWindow(hwnd);
-        let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
 
-        let lw = if cfg.width >= 160.0 { cfg.width } else { 380.0 };
-        let lh = if cfg.height >= 120.0 { cfg.height } else { 440.0 };
-        let pw = (lw * scale).round() as i32;
-        let ph = (lh * scale).round() as i32;
-        let px = (x as f32 * scale).round() as i32;
-        let py = (y as f32 * scale).round() as i32;
+        let pw = if cfg.width >= 160.0 { cfg.width as i32 } else { 380 };
+        let ph = if cfg.height >= 120.0 { cfg.height as i32 } else { 440 };
+        let px = x;
+        let py = y;
 
         let r = SetWindowPos(
             hwnd,
@@ -1595,9 +1605,7 @@ fn restore_window_position(cfg: &Config) {
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
         match r {
-            Ok(()) => log_line(&format!(
-                "恢复: 逻辑({x},{y}) {lw}x{lh} × {scale} → 物理({px},{py}) {pw}x{ph} dpi={dpi}"
-            )),
+            Ok(()) => log_line(&format!("恢复: ({px},{py}) {pw}x{ph} dpi={dpi}")),
             Err(e) => log_line(&format!("恢复位置失败: {e:?}")),
         }
     }
