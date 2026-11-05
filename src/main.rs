@@ -733,10 +733,16 @@ impl PanelApp {
         log_line("PanelApp::new");
         install_fonts(&cc.egui_ctx);
         let cfg = load_config();
-        cc.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                cfg.width, cfg.height,
-            )));
+        // 尺寸不在这里设。
+        //
+        // `InnerSize` 是异步排队的命令，可能在 `restore_window_position`
+        // 之后才生效，把刚设好的尺寸又覆盖一次（实测配置 655×905，
+        // 恢复后变成 648×936）。而且它按逻辑像素解释，与 SetWindowPos
+        // 的物理像素语义不一致。
+        //
+        // 初始尺寸交给 `with_inner_size`，精确尺寸由 300ms 后的
+        // `restore_window_position` 用 SetWindowPos 一次性设定。
+        let _ = (cfg.width, cfg.height);
         let interval = Arc::new(AtomicU64::new(700));
         let (tx, rx) = channel();
         spawn_collector(interval.clone(), tx);
